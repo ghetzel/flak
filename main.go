@@ -5,9 +5,9 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ghetzel/cli"
@@ -17,6 +17,7 @@ import (
 	"github.com/ghetzel/go-stockutil/rxutil"
 	"github.com/ghetzel/go-stockutil/sliceutil"
 	"github.com/ghetzel/go-stockutil/stringutil"
+	"github.com/xxjwxc/gowp/workpool"
 )
 
 type sshResults struct {
@@ -87,6 +88,10 @@ func main() {
 			Name:  `ssh-option, o`,
 			Usage: `Specify an SSH command line option in the form "-o Key=Value"`,
 		},
+		cli.IntFlag{
+			Name:  `concurrency, P`,
+			Usage: `Specifies how many concurrent sessions to execute.`,
+		},
 	}
 
 	app.Before = func(c *cli.Context) error {
@@ -101,7 +106,13 @@ func main() {
 		}
 
 		if hosts, err := parseHosts(c); err == nil {
-			var wg sync.WaitGroup
+			var concurrency = c.Int(`concurrency`)
+
+			if concurrency <= 0 {
+				concurrency = (runtime.NumCPU() * 2)
+			}
+
+			var pool = workpool.New(concurrency)
 			var script string
 			var multiline bool
 
@@ -129,12 +140,15 @@ func main() {
 			sort.Strings(hosts)
 			hosts = sliceutil.UniqueStrings(hosts)
 
-			resultchan := make(chan *sshResults, len(hosts))
-			results := make([]*sshResults, 0)
+			var resultchan = make(chan *sshResults, len(hosts))
+			var results = make([]*sshResults, 0)
 
 			for _, host := range hosts {
-				wg.Add(1)
-				go sshexec(&wg, resultchan, c, host, nil, script, multiline)
+				var hostname = host
+				pool.Do(func() error {
+					resultchan <- sshexec(c, hostname, nil, script, multiline)
+					return nil
+				})
 			}
 
 			go func() {
@@ -143,7 +157,7 @@ func main() {
 				}
 			}()
 
-			wg.Wait()
+			pool.Wait()
 
 			sort.Slice(results, func(i int, j int) bool {
 				return results[i].Hostname < results[j].Hostname
@@ -209,21 +223,13 @@ func parseHosts(c *cli.Context) ([]string, error) {
 }
 
 func sshexec(
-	wg *sync.WaitGroup,
-	reschan chan *sshResults,
 	c *cli.Context,
 	hostname string,
 	env map[string]interface{},
 	script string,
 	multiline bool,
-) {
-	results := new(sshResults)
-
-	defer func() {
-		reschan <- results
-		wg.Done()
-	}()
-
+) (results *sshResults) {
+	results = new(sshResults)
 	var sshTo *executil.Cmd
 
 	scp := c.String(`scp-bin`)
